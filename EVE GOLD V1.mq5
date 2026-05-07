@@ -92,6 +92,11 @@ input bool   EnableNewsFilter = true;        // Activar filtro de noticias de al
 input int    MinsBeforeNews = 30;            // Bloquear trading minutos antes de la noticia
 input int    MinsAfterNews = 30;             // Bloquear trading minutos después de la noticia
 
+// === FILTRO VWAP (Precio Promedio Ponderado por Volumen) ===
+input bool   EnableVWAPFilter = false;       // Activar filtro VWAP como soporte/resistencia dinámico
+input ENUM_TIMEFRAMES VWAPTimeframe = PERIOD_H1; // Timeframe para calcular VWAP
+input int    VWAPLookbackBars = 20;          // Velas para acumular VWAP
+
 //+------------------------------------------------------------------+
 //| CONSTANTES GLOBALES                                              |
 //+------------------------------------------------------------------+
@@ -1336,6 +1341,72 @@ bool GetStandardVolumeMetrics(double &currentVolume, double &averageVolume)
 }
 
 //+------------------------------------------------------------------+
+//| Calcula VWAP: Precio Promedio Ponderado por Volumen              |
+//+------------------------------------------------------------------+
+double GetVWAP(ENUM_TIMEFRAMES tf, int lookbackBars)
+{
+    if(!EnableVWAPFilter)
+        return 0.0;
+
+    int bars = MathMax(1, lookbackBars);
+    double highs[], lows[], closes[];
+    long volumes[];
+    
+    if(CopyHigh(_Symbol, tf, 0, bars, highs) <= 0 ||
+       CopyLow(_Symbol, tf, 0, bars, lows) <= 0 ||
+       CopyClose(_Symbol, tf, 0, bars, closes) <= 0 ||
+       CopyTickVolume(_Symbol, tf, 0, bars, volumes) <= 0)
+        return 0.0;
+
+    ArraySetAsSeries(highs, true);
+    ArraySetAsSeries(lows, true);
+    ArraySetAsSeries(closes, true);
+    ArraySetAsSeries(volumes, true);
+
+    double typicalPrice = 0.0;
+    double numerator = 0.0;
+    double denominator = 0.0;
+
+    for(int i = bars - 1; i >= 0; i--)
+    {
+        typicalPrice = (highs[i] + lows[i] + closes[i]) / 3.0;
+        numerator += typicalPrice * (double)volumes[i];
+        denominator += (double)volumes[i];
+    }
+
+    if(denominator <= 0.0)
+        return 0.0;
+
+    return numerator / denominator;
+}
+
+//+------------------------------------------------------------------+
+//| Filtro VWAP: valida si precio está en relación correcta con VWAP|
+//+------------------------------------------------------------------+
+bool PassesVWAPFilter(bool isBuy, double &vwapValue)
+{
+    vwapValue = 0.0;
+    
+    if(!EnableVWAPFilter)
+        return true;
+
+    vwapValue = GetVWAP(VWAPTimeframe, VWAPLookbackBars);
+    
+    if(vwapValue <= 0.0)
+        return true;
+
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    // Para BUY: precio debe estar por encima del VWAP (VWAP actúa como soporte dinámico)
+    if(isBuy)
+        return (ask > vwapValue);
+
+    // Para SELL: precio debe estar por debajo del VWAP (VWAP actúa como resistencia dinámica)
+    return (bid < vwapValue);
+}
+
+//+------------------------------------------------------------------+
 //| Filtro de volumen para ruptura por lado (buy/sell)              |
 //+------------------------------------------------------------------+
 bool PassesVolumeFilter(bool isBuy, double &currentVolume, double &averageVolume)
@@ -2030,11 +2101,14 @@ void OnTick()
         double buyVolCurrent = 0.0;
         double buyVolAverage = 0.0;
         double bbUpper = 0.0, bbMiddle = 0.0, bbLower = 0.0, bbWidth = 0.0;
+        double vwapValue = 0.0;
         bool adxOk = PassesADXFilter(adxValue);
         bool sellVolumeOk = PassesVolumeFilter(false, sellVolCurrent, sellVolAverage);
         bool buyVolumeOk = PassesVolumeFilter(true, buyVolCurrent, buyVolAverage);
         bool sellBBOk = PassesBBFilter(false, bbUpper, bbMiddle, bbLower, bbWidth);
         bool buyBBOk = PassesBBFilter(true, bbUpper, bbMiddle, bbLower, bbWidth);
+        bool sellVWAPOk = PassesVWAPFilter(false, vwapValue);
+        bool buyVWAPOk = PassesVWAPFilter(true, vwapValue);
 
         if(!adxOk)
         {
@@ -2133,6 +2207,20 @@ void OnTick()
                 buyCandidate = false;
                 buyDecision = "BUY bloqueado por Bollinger Bands";
                 Print("[BLOCK] BUY bloqueado por BB - bbWidth=", DoubleToString(bbWidth, _Digits));
+            }
+
+            if(!sellVWAPOk)
+            {
+                sellCandidate = false;
+                sellDecision = "SELL bloqueado por VWAP dinámico";
+                Print("[BLOCK] SELL bloqueado por VWAP - vwap=", DoubleToString(vwapValue, _Digits), " bid=", DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits));
+            }
+
+            if(!buyVWAPOk)
+            {
+                buyCandidate = false;
+                buyDecision = "BUY bloqueado por VWAP dinámico";
+                Print("[BLOCK] BUY bloqueado por VWAP - vwap=", DoubleToString(vwapValue, _Digits), " ask=", DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits));
             }
 
             if(hasAnyPendingOrder)
@@ -2430,12 +2518,7 @@ void OnTick()
                         else
                         {
                             // Al ser la primera orden, calculamos SL normal
-                            double sellSL = 0.0;
-                            sellSL = NormalizeDouble(sellEntry + slDist, _Digits);
-                            sellSL = NormalizeDouble(sellEntry - slDist, _Digits);
-                            sellSL = NormalizeDouble(sellEntry + slDist, _Digits);
-                            // Nota: Se usa la lógica estándar de SL para la primera entrada
-                            
+                            double sellSL = NormalizeDouble(sellEntry + slDist, _Digits);
                             double sellTP = NormalizeDouble(sellEntry - tpDist, _Digits);
 
                             if(usePendingStops)
@@ -2543,9 +2626,7 @@ void OnTick()
                         }
                         else
                         {
-                            double buySL = 0.0;
-                            buySL = NormalizeDouble(buyEntry - slDist, _Digits);
-                            buySL = NormalizeDouble(buyEntry - slDist, _Digits);
+                            double buySL = NormalizeDouble(buyEntry - slDist, _Digits);
                             double buyTP = NormalizeDouble(buyEntry + tpDist, _Digits);
 
                             if(usePendingStops)
